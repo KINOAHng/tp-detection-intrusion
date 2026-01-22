@@ -1,45 +1,54 @@
-import pandas as pd
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, accuracy_score
-import joblib
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import col
 
-# Charger le fichier nettoyé
-df = pd.read_csv('cleaned_network_logs.csv')
+spark = SparkSession.builder \
+    .appName("Train Intrusion Model") \
+    .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000") \
+    .config("spark.hadoop.fs.s3a.access.key", "minioadmin") \
+    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin123") \
+    .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+    .getOrCreate()
 
-# Label et features
-y = df['Intrusion']
-X = df.drop('Intrusion', axis=1)
+# Lire cleaned depuis MinIO
+df = spark.read.csv("s3a://logs/cleaned_network_logs.csv", header=True, inferSchema=True)
 
+# Cast label si besoin
+df = df.withColumn("Intrusion", col("Intrusion").cast("double"))  # Pour MLlib, label en double
+
+# Catégorielles et numériques
 categorical_cols = ['Request_Type', 'Protocol', 'User_Agent', 'Status', 'Scan_Type', 'src_country', 'dst_country']
 numerical_cols = ['Port', 'Payload_Size']
 
-# Préprocesseur
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_cols),
-        ('num', StandardScaler(), numerical_cols)
-    ])
+# Stages pipeline
+indexers = [StringIndexer(inputCol=c, outputCol=c + "_index", handleInvalid="keep") for c in categorical_cols]
+encoders = [OneHotEncoder(inputCol=c + "_index", outputCol=c + "_vec") for c in categorical_cols]
+assembler = VectorAssembler(inputCols=[c + "_vec" for c in categorical_cols] + numerical_cols, outputCol="features")
+scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures")
+rf = RandomForestClassifier(labelCol="Intrusion", featuresCol="scaledFeatures", numTrees=100)
 
-X_processed = preprocessor.fit_transform(X)
+pipeline = Pipeline(stages=indexers + encoders + [assembler, scaler, rf])
 
-# Split train/test
-X_train, X_test, y_train, y_test = train_test_split(X_processed, y, test_size=0.2, random_state=42, stratify=y)
+# Split
+train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
 
-# Modèle
-model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
-model.fit(X_train, y_train)
+# Train
+model = pipeline.fit(train_data)
 
 # Prédictions
-y_pred = model.predict(X_test)
+predictions = model.transform(test_data)
 
-# Résultats
-print("Accuracy :", accuracy_score(y_test, y_pred))
-print(classification_report(y_test, y_pred, target_names=['Normal', 'Intrusion']))
+# Éval
+evaluator = MulticlassClassificationEvaluator(labelCol="Intrusion", predictionCol="prediction", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print(f"Accuracy: {accuracy}")
 
-# Sauvegarder
-joblib.dump(preprocessor, 'preprocessor.joblib')
-joblib.dump(model, 'random_forest_model.joblib')
-print("Modèle et preprocessor sauvegardés !")
+# Sauvegarder prédictions (pour Trino) et model
+predictions.write.mode("overwrite").parquet("s3a://logs/predictions.parquet")
+model.write().overwrite().save("s3a://logs/random_forest_model")
+
+spark.stop()
